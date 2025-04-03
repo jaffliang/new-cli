@@ -17,7 +17,7 @@
 确保您已安装 Rust 开发环境，然后执行：
 
 ```bash
-git clone https://github.com/yourusername/new-cli
+git clone https://github.com/jaffliang/new-cli
 cd new-cli
 cargo install --path .
 ```
