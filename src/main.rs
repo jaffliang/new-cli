@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::fs;
@@ -27,26 +28,8 @@ fn ensure_template_dir() -> Result<PathBuf> {
     if !template_dir.exists() {
         fs::create_dir_all(&template_dir).context("无法创建模板目录")?;
 
-        // 从项目模板目录复制默认模板
-        // let default_template = PathBuf::from("template/index.html");
-        // let template_content = fs::read_to_string(&default_template)
-        //     .context("无法读取默认模板文件")?;
-        let template_content = r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="X-UA-Compatible" content="ie=edge" />
-  <title>Document</title>
-  <style></style>
-</head>
-<body>
-
-</body>
-<script>
-  
-</script>
-</html>"#;
+        // Embed the default template content from the project's template/index.html at compile time
+        let template_content = include_str!("../template/index.html");
 
         let target_template = template_dir.join("index.html");
         fs::write(&target_template, template_content).context("无法写入默认模板到用户目录")?;
@@ -70,20 +53,39 @@ fn get_default_editor() -> &'static str {
 /// 如果不存在，尝试查找相同后缀的其他模板文件
 /// 如果仍未找到，返回None
 fn find_template_file(template_dir: &PathBuf, filename: &str, extension: &str) -> Option<PathBuf> {
-    // 首先检查指定的模板文件是否存在
-    let specified_template = template_dir.join(format!("{}.{}", filename, extension));
-    if specified_template.exists() {
-        return Some(specified_template);
+    let canonical_template_dir = match fs::canonicalize(template_dir) {
+        Ok(path) => path,
+        Err(_) => return None, // Cannot canonicalize template_dir, unsafe to proceed
+    };
+
+    // 首先检查指定的模板文件是否存在并进行路径验证
+    let specified_template_name = format!("{}.{}", filename, extension);
+    let specified_template_path = template_dir.join(&specified_template_name);
+
+    if specified_template_path.exists() {
+        if let Ok(canonical_specified_path) = fs::canonicalize(&specified_template_path) {
+            if canonical_specified_path.starts_with(&canonical_template_dir) {
+                return Some(specified_template_path); // Return original path, not canonicalized one
+            }
+        }
+        // If canonicalization fails or path is not within template_dir,
+        // proceed to search other files (treat as if specific template not found securely)
     }
 
-    // 如果指定模板不存在，查找相同后缀的任意文件
+    // 如果指定模板不存在或不安全，查找相同后缀的任意文件
     if let Ok(entries) = fs::read_dir(template_dir) {
         for entry in entries.filter_map(Result::ok) {
             let path = entry.path();
             if path.is_file() {
                 if let Some(ext) = path.extension() {
                     if ext == extension {
-                        return Some(path);
+                        // Verify that this path is also within the template_dir
+                        if let Ok(canonical_entry_path) = fs::canonicalize(&path) {
+                            if canonical_entry_path.starts_with(&canonical_template_dir) {
+                                return Some(path); // Return original path
+                            }
+                        }
+                        // If canonicalization fails or path is not within template_dir, skip
                     }
                 }
             }
@@ -94,8 +96,43 @@ fn find_template_file(template_dir: &PathBuf, filename: &str, extension: &str) -
     None
 }
 
+// Public function for validating CLI inputs
+pub fn validate_cli_inputs(filename: &str, extension: &str) -> Result<(), String> {
+    let invalid_chars = ["/", "\\", ".."];
+    for &char_set in &invalid_chars {
+        if filename.contains(char_set) {
+            return Err(format!(
+                "错误：文件名 '{}' 包含无效字符 '{}'。",
+                filename, char_set
+            ));
+        }
+        if extension.contains(char_set) {
+            return Err(format!(
+                "错误：文件后缀 '{}' 包含无效字符 '{}'。",
+                extension, char_set
+            ));
+        }
+    }
+
+    if filename.is_empty() {
+        return Err("错误：文件名不能为空。".to_string());
+    }
+
+    if extension.is_empty() {
+        return Err("错误：文件后缀不能为空。".to_string());
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Validate filename and extension using the new function
+    if let Err(e) = validate_cli_inputs(&cli.filename, &cli.extension) {
+        eprintln!("{}", e);
+        std::process::exit(1);
+    }
 
     // 确保模板目录存在
     let template_dir = ensure_template_dir()?;
@@ -117,10 +154,25 @@ fn main() -> Result<()> {
 
     // 创建目标文件名
     let target_filename = format!("{}.{}", cli.filename, cli.extension);
-    let target_path = PathBuf::from(&target_filename);
+    
+    // --- Path validation for target file ---
+    let current_dir = std::env::current_dir().context("无法获取当前目录")?;
+    let canonical_current_dir = current_dir.canonicalize().context("无法规范化当前目录路径")?;
+    
+    let absolute_target_path = canonical_current_dir.join(&target_filename);
+
+    // Ensure the target path is directly within the canonical current working directory
+    if absolute_target_path.parent() != Some(canonical_current_dir.as_path()) {
+        eprintln!(
+            "错误：目标文件路径 '{:?}' 不在当前工作目录内。",
+            absolute_target_path
+        );
+        std::process::exit(1);
+    }
+    // --- End of path validation ---
 
     // 写入新文件
-    fs::write(&target_path, template_content)
+    fs::write(&absolute_target_path, template_content)
         .with_context(|| format!("无法创建文件 {}", target_filename))?;
 
     println!("成功创建文件: {}", target_filename);
@@ -128,7 +180,7 @@ fn main() -> Result<()> {
     // 使用默认编辑器打开新文件
     let editor = get_default_editor();
     match Command::new(editor)
-        .arg(&target_path)
+        .arg(&absolute_target_path) // Use the validated absolute_target_path
         .spawn()
         .with_context(|| format!("无法使用 {} 打开文件", editor))
     {
@@ -137,4 +189,74 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_cli_inputs_valid() {
+        assert!(validate_cli_inputs("index", "html").is_ok());
+        assert!(validate_cli_inputs("my_file-123", "txt").is_ok());
+    }
+
+    #[test]
+    fn test_validate_filename_empty() {
+        let result = validate_cli_inputs("", "html");
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "错误：文件名不能为空。");
+    }
+
+    #[test]
+    fn test_validate_filename_invalid_chars() {
+        let chars = ["/", "\\", ".."];
+        for &char_set in &chars {
+            let filename = format!("file{}", char_set);
+            let result = validate_cli_inputs(&filename, "html");
+            assert!(result.is_err());
+            assert_eq!(
+                result.unwrap_err(),
+                format!(
+                    "错误：文件名 '{}' 包含无效字符 '{}'。",
+                    filename, char_set
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_extension_empty() {
+        let result = validate_cli_inputs("index", "");
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "错误：文件后缀不能为空。");
+    }
+
+    #[test]
+    fn test_validate_extension_invalid_chars() {
+        let chars = ["/", "\\", ".."];
+        for &char_set in &chars {
+            let extension = format!("ext{}", char_set);
+            let result = validate_cli_inputs("index", &extension);
+            assert!(result.is_err());
+            assert_eq!(
+                result.unwrap_err(),
+                format!(
+                    "错误：文件后缀 '{}' 包含无效字符 '{}'。",
+                    extension, char_set
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_both_invalid_filename_takes_precedence() {
+        // Test that filename error is reported first if both are invalid (due to order of checks)
+        let result = validate_cli_inputs("file/", "ext/");
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "错误：文件名 'file/' 包含无效字符 '/'。"
+        );
+    }
 }
